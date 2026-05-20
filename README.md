@@ -41,4 +41,4 @@
 
 
 22.04 Поврзување со Kaggle DataSet
-
+20.05 Fixing Dataset problem, training it. Fixing the problem with the API Key. Starting to make a interface for the Dataset.
