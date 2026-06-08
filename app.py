@@ -1,30 +1,24 @@
-from flask import Flask, render_template, request
+from flask import Flask, render_template, request, jsonify, session
+from dotenv import load_dotenv
+load_dotenv()
 import pickle
 import requests
 from bs4 import BeautifulSoup
-from dotenv import load_dotenv
 import os
 import re
 from googlesearch import search
-from google import genai
 from pathlib import Path
 import traceback
 
-# ==============================
-# LOAD ENV (FIX FOR WINDOWS)
-# ==============================
-
-env_path = Path('.') / '.env'
-load_dotenv(dotenv_path=env_path)
-
-API_KEY = os.getenv("GOOGLE_API_KEY")
-
-if not API_KEY:
-    raise ValueError("❌ GOOGLE_API_KEY НЕ Е ПРОНАЈДЕН!")
-
-client = genai.Client(api_key=API_KEY)
-
 app = Flask(__name__)
+app.secret_key = "fake-news-detector-secret-key-2024"
+
+# ==============================
+# GROQ API CONFIG
+# ==============================
+
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "your-groq-api-key-here")
+GROQ_MODEL = "llama-3.3-70b-versatile"  # Може да смениш во: llama-3.1-70b-versatile
 
 # ==============================
 # LOAD ML MODELS
@@ -48,10 +42,8 @@ def get_text_from_url(url):
         headers = {"User-Agent": "Mozilla/5.0"}
         r = requests.get(url, headers=headers, timeout=10)
         soup = BeautifulSoup(r.text, "html.parser")
-
         for el in soup(["script", "style"]):
             el.extract()
-
         paragraphs = soup.find_all("p")
         return " ".join([p.get_text() for p in paragraphs])[:3000]
     except:
@@ -73,18 +65,46 @@ def search_related_news(query):
         return ""
 
 # ==============================
+# GROQ HELPER (замена за Ollama)
+# ==============================
+
+def ask_groq(prompt):
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are a strict fact-checking assistant. Always respond in the exact format requested. Never add text before LABEL:."
+            },
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ],
+        "temperature": 0.1,  # Ниска температура = поконзистентни одговори
+        "max_tokens": 1000
+    }
+    response = requests.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers=headers,
+        json=payload,
+        timeout=30
+    )
+    response.raise_for_status()
+    return response.json()["choices"][0]["message"]["content"].strip()
+
+# ==============================
 # EXTRACT CLAIM
 # ==============================
 
 def extract_claim(text):
     try:
-        response = client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=f"Extract main claim:\n{text[:1200]}"
-        )
-        return response.text.strip()
-    except Exception:
-        traceback.print_exc()
+        return ask_groq(f"Extract the main claim from this text in one sentence. Return only the claim, nothing else:\n{text[:1200]}")
+    except:
         return text[:200]
 
 # ==============================
@@ -96,32 +116,88 @@ def verify_with_ai(text):
         claim = extract_claim(text)
         web_sources = search_related_news(claim)
 
-        prompt = f"""
-ТИ СИ ПРОФЕСИОНАЛЕН FACT CHECKER.
+        prompt = f"""You are a strict fact checker. Your job is to determine if a claim is FAKE or REAL.
 
-ВЕСТ:
+CRITICAL RULES:
+- If the claim says someone is dead but they are alive = FAKE
+- If the claim says someone holds a position but they do not = FAKE
+- If the claim says something happened but it did not = FAKE
+- If the claim is misleading, exaggerated, or false = FAKE
+- If the claim is accurate and supported by evidence = REAL
+- You MUST start your response with LABEL: and nothing else before it
+
+Respond in EXACTLY this format, no extra text before LABEL:
+
+LABEL: FAKE
+CONFIDENCE: 95
+REASON: Your explanation here
+
+---
+
+Claim to verify:
 {text[:1200]}
 
-ИНТЕРНЕТ ИЗВОРИ:
-{web_sources[:3000]}
+Evidence from the internet:
+{web_sources[:2000]}
 
-ОДГОВОР:
-LABEL: REAL или FAKE
-CONFIDENCE: 0-100
-REASON: објаснување на македонски
-"""
+Now respond starting with LABEL:"""
 
-        response = client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=prompt
-        )
+        output = ask_groq(prompt)
 
-        output = response.text.upper()
+        print("=== RAW OUTPUT ===")
+        print(output)
+        print("==================")
 
-        label = "FAKE" if "FAKE" in output else "REAL"
-        conf_match = re.search(r"CONFIDENCE:\s*(\d+)", output)
-        ai_conf = int(conf_match.group(1)) if conf_match else 80
-        reason = response.text.split("REASON:")[-1].strip()
+        # Clean output — ако моделот напишал нешто пред LABEL:
+        output_clean = output.strip()
+        if "LABEL:" in output_clean.upper():
+            idx = output_clean.upper().index("LABEL:")
+            output_clean = output_clean[idx:]
+
+        # Parse LABEL
+        label_match = re.search(r"LABEL:\s*(FAKE|REAL)", output_clean.upper())
+        if label_match:
+            label = label_match.group(1)
+        else:
+            # Fallback: брои FAKE vs REAL keywords
+            upper = output_clean.upper()
+            fake_keywords = ["FAKE", "FALSE", "INCORRECT", "NOT TRUE", "MISINFORMATION", "DIED", "DEAD", "IS NOT REAL"]
+            real_keywords = ["REAL", "TRUE", "ACCURATE", "CONFIRMED", "CORRECT", "VERIFIED"]
+            fake_score = sum(1 for kw in fake_keywords if kw in upper)
+            real_score = sum(1 for kw in real_keywords if kw in upper)
+            label = "FAKE" if fake_score >= real_score else "REAL"
+
+        # Parse CONFIDENCE
+        conf_match = re.search(r"CONFIDENCE:\s*(\d+)", output_clean.upper())
+        ai_conf = int(conf_match.group(1)) if conf_match else 75
+
+        # Parse REASON
+        reason_match = re.search(r"REASON:\s*(.+)", output_clean, re.IGNORECASE | re.DOTALL)
+        reason = reason_match.group(1).strip() if reason_match else output_clean
+
+        # ==============================
+        # SANITY CHECKS
+        # ==============================
+
+        # Sanity check 1: тврди дека некој е мртов, но причината вели дека е жив
+        dead_claim = any(word in text.upper() for word in ["IS DEAD", "HAS DIED", "PASSED AWAY", "WAS KILLED"])
+        alive_in_reason = any(word in reason.upper() for word in ["STILL ALIVE", "IS ALIVE", "STILL ACTIVE", "STILL LIVING"])
+        if dead_claim and alive_in_reason and label == "REAL":
+            label = "FAKE"
+            ai_conf = max(ai_conf, 85)
+
+        # Sanity check 2: причината содржи контрадикции — AI вели "не е точно" но label е REAL
+        contradiction_phrases = [
+            "NOT THE", "IS NOT", "WAS NOT", "ARE NOT",
+            "COULDN'T FIND", "COULD NOT FIND", "NO EVIDENCE",
+            "NOT ACCURATE", "INCORRECT", "DOES NOT HOLD",
+            "RATHER THAN", "INSTEAD OF", "ACTUALLY",
+            "HOWEVER", "IN FACT", "CONTRARY"
+        ]
+        contradiction_score = sum(1 for phrase in contradiction_phrases if phrase in reason.upper())
+        if contradiction_score >= 2 and label == "REAL":
+            label = "FAKE"
+            ai_conf = max(ai_conf, 80)
 
         return label, ai_conf, reason
 
@@ -130,44 +206,61 @@ REASON: објаснување на македонски
         return "REAL", 0, f"AI ERROR: {str(e)}"
 
 # ==============================
-# FLASK
+# FLASK ROUTES
 # ==============================
 
-@app.route("/", methods=["GET", "POST"])
+@app.route("/", methods=["GET"])
 def index():
-    result, confidence_display, explanation = "", "", ""
+    history = session.get("history", [])
+    return render_template("index.html", history=history)
 
-    if request.method == "POST":
-        user_input = request.form.get("news", "").strip()
 
-        if not user_input:
-            return render_template("index.html", result="Внесете текст или линк.")
+@app.route("/chat", methods=["POST"])
+def chat():
+    data = request.get_json()
+    user_input = data.get("message", "").strip()
 
-        final_text = get_text_from_url(user_input) if user_input.startswith("http") else user_input
+    if not user_input:
+        return jsonify({"error": "Внесете текст или линк."})
 
-        if not final_text:
-            return render_template("index.html", result="Не може да се прочита линкот.")
+    final_text = get_text_from_url(user_input) if user_input.startswith("http") else user_input
 
-        label, ai_conf, ai_reason = verify_with_ai(final_text)
+    if not final_text:
+        return jsonify({"error": "Не може да се прочита линкот."})
 
-        ml_conf = 0
-        if model and vectorizer:
-            try:
-                vec = vectorizer.transform([final_text])
-                ml_conf = max(model.predict_proba(vec)[0]) * 100
-            except:
-                ml_conf = 0
+    label, ai_conf, ai_reason = verify_with_ai(final_text)
 
-        final_status = "ЛАЖНА ВЕСТ 🔴" if label == "FAKE" else "ВЕРОЈАТНО ВИСТИНА 🟢"
+    ml_conf = 0
+    if model and vectorizer:
+        try:
+            vec = vectorizer.transform([final_text])
+            ml_conf = max(model.predict_proba(vec)[0]) * 100
+        except:
+            ml_conf = 0
 
-        result = f"Резултат: {final_status}"
-        confidence_display = f"AI сигурност: {ai_conf}% | ML сигурност: {round(ml_conf,2)}%"
-        explanation = ai_reason
+    status = "ЛАЖНА ВЕСТ 🔴" if label == "FAKE" else "ВЕРОЈАТНО ВИСТИНА 🟢"
 
-    return render_template("index.html",
-                           result=result,
-                           confidence=confidence_display,
-                           explanation=explanation)
+    reply = {
+        "status": status,
+        "ai_conf": ai_conf,
+        "ml_conf": round(ml_conf, 2),
+        "reason": ai_reason,
+        "label": label
+    }
+
+    if "history" not in session:
+        session["history"] = []
+    session["history"].append({"user": user_input, "bot": reply})
+    session.modified = True
+
+    return jsonify(reply)
+
+
+@app.route("/clear", methods=["POST"])
+def clear():
+    session.pop("history", None)
+    return jsonify({"ok": True})
+
 
 # ==============================
 
