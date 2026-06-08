@@ -89,3 +89,8 @@ python app.py
 ## Напомена
 
 Бидејќи се користи постар AI модел се јавува knowledge cutoff и според тоа на некои информации одговорите можеби нема да се точни. На пример доколку имаме прашање околу политиката во Македонија одговорот на моделот ќе се базира на информации од пред неколку години и можеби нема одговорот да е точен. На пример како одговор на __"Hristijan Mickoski is the prime minister of North Macedonia"__ добиваме __"According to available information, Dimitar Kovačevski is the current Prime Minister of North Macedonia, not Hristijan Mickoski. Hristijan Mickoski is the leader of the opposition party VMRO-DPMNE"__, што ни покажува дека AI моделот користи застарени информации. 
+
+
+## Изглед на апликацијата
+
+![AI Lie Detector](images/screenshot.png)
