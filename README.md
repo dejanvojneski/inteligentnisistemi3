@@ -93,4 +93,10 @@ python app.py
 
 ## Изглед на апликацијата
 
+### Почетна страна
 ![AI Lie Detector](images/screenshot.png)
+
+### Резултат од анализа
+![Result](images/result.png)
+
+
